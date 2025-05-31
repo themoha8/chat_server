@@ -2,7 +2,7 @@
 #define BUILTIN_H_SENTRY
 
 typedef struct string_t {
-	uchar *base;
+	char *base;
 	uint64 len;
 } string;
 

@@ -191,7 +191,7 @@ string unsafe_string(const uchar * buf, uint64 len)
 {
 	string s;
 
-	s.base = (uchar *) buf;
+	s.base = (char *) buf;
 	s.len = len;
 
 	return s;
@@ -423,7 +423,7 @@ string sl_to_str_new_base(slice s)
 	mem = arena_alloc(&global_arena, s.len);
 	assert(mem != nil);
 
-	ret.base = mem;
+	ret.base = (char *) mem;
 	ret.len = s.len;
 
 	copy(get_slice(ret), s);

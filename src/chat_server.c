@@ -6,39 +6,53 @@
 #include "pool.h"
 #include "arena.h"
 
-enum { max_events = 16, max_buf = 3, max_sess = 2 };
+enum { max_line_len = 3, backlog = 128, max_events = 16, max_clients = 2 };
 
-typedef struct session_t {
+//static const char welcome_msg[] = "Welcome to the chat, you are known as ";
+//static const char entered_msg[] = " has entered the chat";
+//static const char left_msg[] = " has left the chat";
+static const char too_long_msg[] = "Line too long! Good bye...\n";
+static const char limit_conn_msg[] = "Connection limit reached, rejecting client\n";
+
+typedef struct client_t {
 	int fd;
 	int buf_used;
-	char buf[max_buf + 1];
-	struct session_t *next;
-} session;
+	char buf[max_line_len + 1];
+	char *name;
+	struct client_t *next;
+} client;
 
 typedef struct server_t {
 	int ls;
-	session *first;
-} server_str;
+	client *first;
+} server;
 
-enum { arena_size = sizeof(session) * max_sess + sizeof(server_str),
-	pool_size = max_sess * sizeof(session),
-	default_alignment = 8
+enum { arena_size = sizeof(client) * max_clients + sizeof(server),
+	pool_size = max_clients * sizeof(client),
+	default_alignment = sizeof(void *),
 };
-
-enum { ok_read = 0, err_read, eof_read, long_read };
 
 static uint16 hton(uint16 port)
 {
 	return (port << 8) | (port >> 8);
 }
 
-static void session_send_if_lf(session * sess, server_str * serv)
+static void session_send_all(string msg, int except, client * to)
 {
-	session *f;
+	while (to != nil) {
+		if (except != to->fd)
+			sys_write(to->fd, (char *) msg.base, msg.len, nil);
+		to = to->next;
+	}
+}
+
+static void check_line(client * c, server * serv)
+{
+	string m;
 	int i, pos = -1;
 
-	for (i = 0; i < sess->buf_used; i++)
-		if (sess->buf[i] == '\n') {
+	for (i = 0; i < c->buf_used; i++)
+		if (c->buf[i] == '\n') {
 			pos = i;
 			break;
 		}
@@ -46,32 +60,31 @@ static void session_send_if_lf(session * sess, server_str * serv)
 	if (pos == -1)
 		return;
 
-	sess->buf[pos + 1] = '\0';
+	c->buf[pos + 1] = '\0';
 
-	for (f = serv->first; f != nil; f = f->next) {
-		if (f->fd != sess->fd)
-			sys_write(f->fd, sess->buf, pos + 1, nil);
-	}
+	m.base = c->buf;
+	m.len = pos + 2;
+	session_send_all(m, c->fd, serv->first);
 
-	sess->buf_used -= pos + 1;
-	memmove(sess->buf, sess->buf + pos + 1, sess->buf_used);
+	c->buf_used -= pos + 1;
+	memmove(c->buf, c->buf + pos + 1, c->buf_used);
 }
 
-static void session_close(session * sess, server_str * serv, pool * p)
+static void session_close(client * c, server * serv, pool * p)
 {
-	session *prev = nil;
-	session *temp = serv->first;
+	client *prev = nil;
+	client *temp = serv->first;
 
-	sys_close(sess->fd);
+	sys_close(c->fd);
 
-	if (temp != nil && temp->fd == sess->fd) {
+	if (temp != nil && temp->fd == c->fd) {
 		serv->first = temp->next;
-		//fmt_fprintf(stdout, "free chank pointer: %p\n", temp);
+		fmt_fprintf(stdout, "free chank pointer: %p\n", temp);
 		pool_put(p, temp);
 		return;
 	}
 
-	while (temp != nil && temp->fd != sess->fd) {
+	while (temp != nil && temp->fd != c->fd) {
 		prev = temp;
 		temp = temp->next;
 	}
@@ -82,17 +95,17 @@ static void session_close(session * sess, server_str * serv, pool * p)
 	}
 
 	prev->next = temp->next;
-	//fmt_fprintf(stdout, "free chank pointer: %p\n", temp);
+	fmt_fprintf(stdout, "free chank pointer: %p\n", temp);
 	pool_put(p, temp);
 }
 
-static int session_read(session * sess)
+static void session_read(client * c, server * serv, pool * p)
 {
 	const error *err;
-	int n, bufp = sess->buf_used;
+	int n, bufp = c->buf_used;
 
 	for (;;) {
-		n = sys_read(sess->fd, sess->buf + bufp, max_buf - bufp, &err);
+		n = sys_read(c->fd, c->buf + bufp, max_line_len - bufp, &err);
 		if (err != nil) {
 			if (err->code == EAGAIN)
 				break;
@@ -100,28 +113,32 @@ static int session_read(session * sess)
 				continue;
 			else {
 				fmt_fprintf(stderr, "sys_read failed: %s\n", err->msg);
-				return err_read;
+				session_close(c, serv, p);
+				return;
 			}
 		} else if (n == 0) {
-			return eof_read;
+			check_line(c, serv);
+			session_close(c, serv, p);
+			return;
 		}
 
-		sess->buf_used += n;
-		if (sess->buf_used == max_buf) {
-			sys_write(sess->fd, "Line too long! Good bye...\n", 28, nil);
-			return long_read;
+		c->buf_used += n;
+		if (c->buf_used == max_line_len) {
+			sys_write(c->fd, too_long_msg, sizeof(too_long_msg), nil);
+			session_close(c, serv, p);
+			return;
 		}
 	}
-	return ok_read;
+	check_line(c, serv);
 }
 
 /* =========== server =========== */
 
-static void server_handle(int epfd, server_str * serv, pool * p)
+static void server_handle(int epfd, server * serv, pool * p)
 {
 	int conn_sock;
 	struct epoll_event ev;
-	session *sess;
+	client *c;
 	const error *err;
 
 	for (;;) {
@@ -136,40 +153,40 @@ static void server_handle(int epfd, server_str * serv, pool * p)
 		}
 
 		/* fd 0, 1, 2, 3 (epoll), 4 (ls) is busy */
-		if (conn_sock == max_sess + 5) {
-			sys_write(conn_sock, "Connection limit reached, rejecting client\n", 44, nil);
+		if (conn_sock == max_clients + 5) {
+			sys_write(conn_sock, limit_conn_msg, sizeof(limit_conn_msg), nil);
 			sys_close(conn_sock);
 			continue;
 		}
 
-		sess = pool_get(p);
-		//fmt_fprintf(stdout, "new chank pointer: %p\n", sess);
-		if (sess == nil) {
+		c = pool_get(p);
+		fmt_fprintf(stdout, "new chank pointer: %p\n", c);
+		if (c == nil) {
 			sys_write(stderr, "Failed to acquire new session\n", 30, nil);
 			sys_close(conn_sock);
 			continue;
 		}
 		ev.events = EPOLLIN | EPOLLET;
-		ev.data.ptr = sess;
+		ev.data.ptr = c;
 		err = sys_epoll_ctl(epfd, epoll_ctl_add, conn_sock, &ev);
 		if (err != nil) {
 			fmt_fprintf(stderr, "sys_epoll_ctl failed: %s\n", err->msg);
 			sys_close(conn_sock);
-			pool_put(p, sess);
+			pool_put(p, c);
 			continue;
 		}
-		sess->fd = conn_sock;
-		sess->buf_used = 0;
-		sess->next = serv->first;
-		serv->first = sess;
+		c->fd = conn_sock;
+		c->buf_used = 0;
+		c->name = nil;
+		c->next = serv->first;
+		serv->first = c;
 	}
 }
 
-static int server_go(server_str * serv, pool * p)
+static int server_go(server * serv, pool * p)
 {
 	struct epoll_event ev, evt[max_events] = { 0 };
-	int epfd, res, i;
-	session *sess;
+	int epfd, i;
 	const error *err;
 
 	epfd = sys_epoll_create1(0, &err);
@@ -200,23 +217,14 @@ static int server_go(server_str * serv, pool * p)
 		for (i = 0; i < ev_count; i++) {
 			if (evt[i].data.ptr == serv)
 				server_handle(epfd, serv, p);
-			else {
-				sess = (session *) evt[i].data.ptr;
-				res = session_read(sess);
-				if (res == eof_read) {
-					session_send_if_lf(sess, serv);
-					session_close(sess, serv, p);
-				} else if (res == ok_read)
-					session_send_if_lf(sess, serv);
-				else
-					session_close(sess, serv, p);
-			}
+			else
+				session_read(evt[i].data.ptr, serv, p);
 		}
 	}
 	return 0;
 }
 
-static int server_init(server_str * serv, uint16 port)
+static int server_init(server * serv, uint16 port)
 {
 	struct sockaddr_in addr;
 	int enable = 1;
@@ -246,7 +254,7 @@ static int server_init(server_str * serv, uint16 port)
 		return 3;
 	}
 
-	err = sys_listen(serv->ls, 128);
+	err = sys_listen(serv->ls, backlog);
 	if (err != nil) {
 		fmt_fprintf(stderr, "sys_listen failed: %s\n", err->msg);
 		return 4;
@@ -260,11 +268,11 @@ void _start(void)
 	arena a;
 	pool p;
 	byte *pbuf;
-	server_str *serv;
+	server *serv;
 
 	arena_create(&a, arena_size);
 	fmt_fprintf(stdout, "arena pointer: %p, arena buf_size: %d\n", a.buf, a.buf_len);
-	serv = (server_str *) arena_alloc(&a, sizeof(server_str));
+	serv = (server *) arena_alloc(&a, sizeof(server));
 	if (serv == nil) {
 		fmt_fprintf(stderr, "arena_alloc (server_str) failed\n");
 		sys_exit(1);
@@ -277,7 +285,7 @@ void _start(void)
 		sys_exit(2);
 	}
 	fmt_fprintf(stdout, "pool pointer: %p, pool size: %d\n", pbuf, a.curr_off - a.prev_off);
-	pool_init(&p, pbuf, pool_size, sizeof(session), default_alignment);
+	pool_init(&p, pbuf, pool_size, sizeof(client), default_alignment);
 
 	if (server_init(serv, 7070))
 		sys_exit(3);
