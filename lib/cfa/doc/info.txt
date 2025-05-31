@@ -1,0 +1,25 @@
+## Colling conventions
+
+### Unix 64bit
+
+Registers that must be saved and restored - rbx, rbp, r12-r15
+Registers used for parameters transfer - rdi, rsi, rdx, rcx, r8, r9, xmm0-xmm7, ymm0-ymm7, zmm0-zmm7
+Registers used for return value - rax, rdx, xmm0, xmm1, ymm0, zmm0, st0, st1
+
+## Implimentation of procedures
+
+### Memcpy
+
+Constants:
+Define wsize (size of type int for system) and wmask (for alignment)
+
+Procedure:
+1. Define how we will copy data, forward or backward, if src < dst, then we copy backward, this allows us to avoid problems with copying overlapping areas. If src > dst, then we copy forward.
+
+One loop
+2. If the lower 2 bits (if int is 32) of the src or dst address do not match or size of wsize is larger than the string size (length), then copy byte by byte. For efficient copying, it is desirable that the addresses be multiples of 4. Otherwise, if the lower bits of the address match, then copy until alignment and then copy by words.
+
+Two loop
+3. Copy by words if possible.
+
+4. Copy remaining bytes are less then a word (wsize).
