@@ -16,8 +16,9 @@ static const char limit_conn_msg[] = "Connection limit reached, rejecting client
 enum { max_line_len = 3,
 	backlog = 128,
 	max_events = 16,
-	max_clients = 2,
-	max_pools = 16 / 8
+	max_clients = 1,
+	max_pools = 24 / 8,
+	page_size = 4096
 };
 
 typedef struct client_t {
@@ -94,6 +95,7 @@ static void session_close(client * c, server * serv)
 	client *prev = nil;
 	client *temp = nil;
 	client_pool *clp;
+	const error *err;
 	int i;
 
 	sys_close(c->fd);
@@ -105,6 +107,28 @@ static void session_close(client * c, server * serv)
 			clp->client = temp->next;
 			clp->free_ch++;
 			clp->used_ch--;
+			if (serv->n_pls > 1 && clp->used_ch == 0) {
+				err = sys_munmap((uintptr) clp, page_size);
+				if (err != nil) {
+					fmt_fprintf(stderr, "session_close: sys_munmap failed: %s\n", err->msg);
+				}
+#ifdef DEBUG_PRINT
+				int n;
+				for (n = 0; n < serv->n_pls; n++)
+					fmt_fprintf(stdout, "before: serv->first_clp[%d]: %p\n", n, serv->first_clp[n]);
+#endif
+				serv->n_pls--;
+				while (i < serv->n_pls) {
+					serv->first_clp[i] = serv->first_clp[i + 1];
+					i++;
+				}
+				serv->first_clp[i] = nil;
+#ifdef DEBUG_PRINT
+				for (n = 0; n < serv->n_pls + 1; n++)
+					fmt_fprintf(stdout, "after: serv->first_clp[%d]: %p\n", n, serv->first_clp[n]);
+#endif
+				return;
+			}
 			pool_put(&clp->p, temp);
 #ifdef DEBUG_PRINT
 			fmt_fprintf(stdout, "free client chunk address: %p\n", temp);
@@ -132,9 +156,30 @@ static void session_close(client * c, server * serv)
 	prev->next = temp->next;
 	clp->free_ch++;
 	clp->used_ch--;
+	if (serv->n_pls > 1 && clp->used_ch == 0) {
+		err = sys_munmap((uintptr) clp, page_size);
+		if (err != nil) {
+			fmt_fprintf(stderr, "session_close: sys_munmap failed: %s\n", err->msg);
+		}
+#ifdef DEBUG_PRINT
+		int n;
+		for (n = 0; n < serv->n_pls; n++)
+			fmt_fprintf(stdout, "before: serv->first_clp[%d]: %p\n", n, serv->first_clp[n]);
+#endif
+		serv->n_pls--;
+		while (i < serv->n_pls) {
+			serv->first_clp[i] = serv->first_clp[i + 1];
+		}
+		serv->first_clp[i] = nil;
+#ifdef DEBUG_PRINT
+		for (n = 0; n < serv->n_pls + 1; n++)
+			fmt_fprintf(stdout, "after: serv->first_clp[%d]: %p\n", n, serv->first_clp[n]);
+#endif
+		return;
+	}
 	pool_put(&clp->p, temp);
 #ifdef DEBUG_PRINT
-	fmt_fprintf(stdout, "new client chunk address: %p\n", c);
+	fmt_fprintf(stdout, "free client chunk address: %p\n", c);
 #endif
 }
 
@@ -151,7 +196,7 @@ static void session_read(client * c, server * serv)
 			else if (err->code == EINTR)
 				continue;
 			else {
-				fmt_fprintf(stderr, "sys_read failed: %s\n", err->msg);
+				fmt_fprintf(stderr, "session_read: sys_read failed: %s\n", err->msg);
 				session_close(c, serv);
 				return;
 			}
@@ -178,7 +223,7 @@ static void session_new_clp(server * serv)
 	byte *pbuf;
 	client_pool *clp_new;
 
-	arena_create(&a, pool_size);
+	arena_create(&a, pool_size + sizeof(client_pool));
 
 	clp_new = (client_pool *) arena_alloc(&a, sizeof(client_pool));
 	if (clp_new == nil) {
