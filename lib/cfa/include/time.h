@@ -18,5 +18,6 @@ struct tm {
 struct tm time_to_tm(int64 t);
 uint64 tm_rfc822_in_slice(slice s, const struct tm *t);
 uint64 tm_in_slice(slice s, struct tm *tm);
+uint64 tm_in_slice2(slice s, struct tm *tm);
 
 #endif

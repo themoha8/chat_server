@@ -278,3 +278,31 @@ uint64 tm_in_slice(slice s, struct tm * tm)
 
 	return n;
 }
+
+/* 15:13:54 MSK */
+uint64 tm_in_slice2(slice s, struct tm * tm)
+{
+	char *buf = s.base;
+	int n = 0;
+
+	n = int_in_slice(s, tm->tm_hour);
+	buf[n++] = ':';
+
+	if (tm->tm_min < 10)
+		buf[n++] = '0';
+
+	n += int_in_slice(slice_left(s, n), tm->tm_min);
+	buf[n++] = ':';
+
+	if (tm->tm_sec < 10)
+		buf[n++] = '0';
+
+	n += int_in_slice(slice_left(s, n), tm->tm_sec);
+	buf[n++] = ' ';
+
+	buf[n++] = 'M';
+	buf[n++] = 'S';
+	buf[n++] = 'K';
+
+	return n;
+}

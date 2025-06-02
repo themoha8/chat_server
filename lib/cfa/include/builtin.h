@@ -57,7 +57,7 @@ slice slice_right(slice s, uint64 r_bytes);
 slice slice_left_right(slice s, uint64 l_bytes, uint64 r_bytes);
 
 string get_string(slice s);
-string unsafe_string(const byte * buf, uint64 len);
+string unsafe_string(const void *buf, uint64 len);
 string unsafe_c_string(const char *c_str);
 string string_left(string s, uint64 l_bytes);
 string string_right(string s, uint64 r_bytes);

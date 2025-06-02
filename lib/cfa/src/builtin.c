@@ -187,7 +187,7 @@ string get_string(slice s)
 	return ret;
 }
 
-string unsafe_string(const uchar * buf, uint64 len)
+string unsafe_string(const void *buf, uint64 len)
 {
 	string s;
 
@@ -199,7 +199,7 @@ string unsafe_string(const uchar * buf, uint64 len)
 
 string unsafe_c_string(const char *c_str)
 {
-	return unsafe_string((uchar *) c_str, c_strlen(c_str));
+	return unsafe_string((char *) c_str, c_strlen(c_str));
 }
 
 string string_left(string s, uint64 lbytes)
@@ -249,7 +249,7 @@ uint64 c_string_in_slice(slice s, const char *c_str)
 
 uint64 c_nstring_in_slice(slice s, const char *c_str, uint64 len)
 {
-	return string_in_slice(s, unsafe_string((uchar *) c_str, len));
+	return string_in_slice(s, unsafe_string((char *) c_str, len));
 }
 
 uint64 string_in_slice(slice sl, string s)
