@@ -12,7 +12,7 @@ LIBINCLUDE = -I lib/cfa/include
 ifeq ($(RELEASE), 1)
 	CFLAGS = -Wall $(LIBINCLUDE) -static -nostdlib -std=c99 -O2 -mavx2
 else
-	CFLAGS = -Wall $(LIBINCLUDE) -static -nostdlib -std=c99 -O0 -ggdb
+	CFLAGS = -Wall $(LIBINCLUDE) -static -nostdlib -std=c99 -O0 -ggdb -DDEBUG_PRINT
 endif
 
 PROGRAM_NAME = bin/chat_server
