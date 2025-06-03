@@ -16,13 +16,13 @@ static const char too_long_name[] = "Name too long! Good bye...\n";
 static const char limit_conn_msg[] = "Connection limit reached, rejecting client\n";
 
 enum {
-	max_line_len = 4,
-	max_name_len = 4,
 	backlog = 128,
+	page_size = 4096,
+	max_line_len = 512,
+	max_name_len = 32,
 	max_events = 16,
-	max_clients = 1,
-	max_pools = 3,
-	page_size = 4096
+	max_clients_in_pool = 1023,
+	max_pools = 16
 };
 
 typedef struct client_t {
@@ -31,9 +31,8 @@ typedef struct client_t {
 	char buf[max_line_len];
 	char name[max_name_len];
 	int name_used;
-	bool name_ok;
+	int name_ok;
 	struct client_t *next;
-	struct client_t *prev;
 } client;
 
 typedef struct client_pool_t {
@@ -49,7 +48,11 @@ typedef struct server_t {
 	client_pool **first_clp;
 } server;
 
-enum { pool_size = sizeof(client) * max_clients,
+enum {
+	/* 142 KB is reserved for one pool.
+	 * 520 byte isn't used.
+	 */
+	pool_size = sizeof(client) * max_clients_in_pool,
 	default_alignment = sizeof(void *)
 };
 
@@ -101,14 +104,12 @@ static void check_line_and_send(client * c, server * serv)
 		fmt_fprintf(stderr, "sys_clock_gettime: %s\n", err->msg);
 		i += c_nstring_in_slice(slice_left(s, i), ": ", 2);
 		i += c_nstring_in_slice(slice_left(s, i), c->buf, pos + 1);
-		i += c_nstring_in_slice(slice_left(s, i), "", 1);
 	} else {
 		t = time_to_tm(tp.tv_sec);
 		i += c_nstring_in_slice(slice_left(s, i), " (", 2);
 		i += tm_in_slice2(slice_left(s, i), &t);
 		i += c_nstring_in_slice(slice_left(s, i), "): ", 3);
 		i += c_nstring_in_slice(slice_left(s, i), c->buf, pos + 1);
-		i += c_nstring_in_slice(slice_left(s, i), "", 1);
 	}
 
 	session_send_all(get_string(slice_right(s, i)), c, serv);
@@ -119,113 +120,67 @@ static void check_line_and_send(client * c, server * serv)
 
 static void session_close(client * c, server * serv)
 {
-	client *prev = nil;
-	client *temp = nil;
+	client **pcur;
 	client_pool *clp;
+	client *t;
 	const error *err;
 	int i = 0;
-	slice s;
-	char msg[max_line_len + sizeof(left_msg)];
 
 	if (c->name_ok == true) {
+		slice s;
+		char msg[max_line_len + sizeof(left_msg)];
 		s = unsafe_slice(msg, sizeof(msg));
-		i = c_string_in_slice(s, c->name);
+		i = c_nstring_in_slice(s, c->name, c->name_used);
 		i += c_nstring_in_slice(slice_left(s, i), left_msg, sizeof(left_msg) - 1);
-		i += c_nstring_in_slice(slice_left(s, i), "\n", 2);
 		session_send_all(get_string(slice_right(s, i)), c, serv);
 	}
-
 	sys_close(c->fd);
+
 	for (i = 0; i < serv->n_pls; i++) {
-		temp = serv->first_clp[i]->client;
 		clp = serv->first_clp[i];
-		if (temp != nil && temp == c) {
-			clp->client = temp->next;
-			clp->free_ch++;
-			clp->used_ch--;
-			if (serv->n_pls > 1 && clp->used_ch == 0) {
-				err = sys_munmap((uintptr) clp, page_size);
-				if (err != nil) {
-					fmt_fprintf(stderr, "session_close: sys_munmap failed: %s\n", err->msg);
-				}
+		pcur = &(clp->client);
+		while (*pcur != nil) {
+			if (*pcur == c) {
+				t = *pcur;
+				*pcur = (*pcur)->next;
+				clp->free_ch++;
+				clp->used_ch--;
+				if (serv->n_pls > 1 && clp->used_ch == 0) {
+					err = sys_munmap((uintptr) clp, page_size);
+					if (err != nil) {
+						fmt_fprintf(stderr, "session_close: sys_munmap failed: %s\n", err->msg);
+					}
 #ifdef DEBUG_PRINT
-				int n;
-				for (n = 0; n < serv->n_pls; n++)
-					fmt_fprintf(stdout, "before: serv->first_clp[%d]: %p\n", n, serv->first_clp[n]);
+					int n;
+					for (n = 0; n < serv->n_pls; n++)
+						fmt_fprintf(stdout, "before: serv->first_clp[%d]: %p\n", n, serv->first_clp[n]);
 #endif
 
-				serv->n_pls--;
-				while (i < serv->n_pls) {
-					serv->first_clp[i] = serv->first_clp[i + 1];
-					i++;
-				}
-				serv->first_clp[i] = nil;
+					/* shift pools in the left after delete one */
+					serv->n_pls--;
+					while (i < serv->n_pls) {
+						serv->first_clp[i] = serv->first_clp[i + 1];
+						i++;
+					}
+					serv->first_clp[i] = nil;
 
 #ifdef DEBUG_PRINT
-				for (n = 0; n < serv->n_pls + 1; n++)
-					fmt_fprintf(stdout, "after: serv->first_clp[%d]: %p\n", n, serv->first_clp[n]);
+					for (n = 0; n < serv->n_pls + 1; n++)
+						fmt_fprintf(stdout, "after: serv->first_clp[%d]: %p\n", n, serv->first_clp[n]);
 #endif
+					return;
+				}
+				pool_put(&clp->p, t);
 
+#ifdef DEBUG_PRINT
+				fmt_fprintf(stdout, "free client chunk address: %p\n", t);
+#endif
 				return;
+			} else {
+				pcur = &(*pcur)->next;
 			}
-			pool_put(&clp->p, temp);
-
-#ifdef DEBUG_PRINT
-			fmt_fprintf(stdout, "free client chunk address: %p\n", temp);
-#endif
-
-			return;
 		}
 	}
-
-	for (i = 0; i < serv->n_pls; i++) {
-		temp = serv->first_clp[i]->client;
-		clp = serv->first_clp[i];
-		while (temp != nil && temp != c) {
-			prev = temp;
-			temp = temp->next;
-		}
-		if (temp != nil)
-			break;
-	}
-
-	if (temp == nil) {
-		fmt_fprintf(stderr, "session_close failed (item not found)\n");
-		return;
-	}
-
-	prev->next = temp->next;
-	clp->free_ch++;
-	clp->used_ch--;
-	if (serv->n_pls > 1 && clp->used_ch == 0) {
-		err = sys_munmap((uintptr) clp, page_size);
-		if (err != nil) {
-			fmt_fprintf(stderr, "session_close: sys_munmap failed: %s\n", err->msg);
-		}
-#ifdef DEBUG_PRINT
-		int n;
-		for (n = 0; n < serv->n_pls; n++)
-			fmt_fprintf(stdout, "before: serv->first_clp[%d]: %p\n", n, serv->first_clp[n]);
-#endif
-
-		serv->n_pls--;
-		while (i < serv->n_pls) {
-			serv->first_clp[i] = serv->first_clp[i + 1];
-		}
-		serv->first_clp[i] = nil;
-
-#ifdef DEBUG_PRINT
-		for (n = 0; n < serv->n_pls + 1; n++)
-			fmt_fprintf(stdout, "after: serv->first_clp[%d]: %p\n", n, serv->first_clp[n]);
-#endif
-
-		return;
-	}
-	pool_put(&clp->p, temp);
-
-#ifdef DEBUG_PRINT
-	fmt_fprintf(stdout, "free client chunk address: %p\n", c);
-#endif
 }
 
 static void session_name_read(client * c, server * serv)
@@ -255,14 +210,14 @@ static void session_name_read(client * c, server * serv)
 
 		c->name_used += n;
 		if (c->name_used > max_name_len) {
-			sys_write(c->fd, too_long_name, sizeof(too_long_name), nil);
+			sys_write(c->fd, too_long_name, sizeof(too_long_name) - 1, nil);
 			session_close(c, serv);
 			return;
 		}
 	}
 
 	for (n = 0; n < c->name_used; n++) {
-		if (c->name[n] == '\n') {
+		if (c->name[n] == '\n' || c->name[n] == '\r') {
 			c->name[n] = '\0';
 			c->name_ok = true;
 			c->name_used = n;
@@ -270,15 +225,16 @@ static void session_name_read(client * c, server * serv)
 	}
 
 	if (c->name_ok == true) {
+		n = 0;
 		s = unsafe_slice(msg, sizeof(msg));
 
 		n = c_nstring_in_slice(s, welcome_msg, sizeof(welcome_msg) - 1);
 		n += c_nstring_in_slice(slice_left(s, n), c->name, c->name_used);
-		n += c_nstring_in_slice(slice_left(s, n), "\n", 2);
+		n += c_nstring_in_slice(slice_left(s, n), "\n", 1);
 		sys_write(c->fd, s.base, n, nil);
 
 		n = c_nstring_in_slice(s, c->name, c->name_used);
-		n += c_nstring_in_slice(slice_left(s, n), entered_msg, sizeof(entered_msg));
+		n += c_nstring_in_slice(slice_left(s, n), entered_msg, sizeof(entered_msg) - 1);
 
 		session_send_all(get_string(slice_right(s, n)), c, serv);
 	}
@@ -310,7 +266,7 @@ static void session_line_read(client * c, server * serv)
 
 		c->buf_used += n;
 		if (c->buf_used > max_line_len) {
-			sys_write(c->fd, too_long_msg, sizeof(too_long_msg), nil);
+			sys_write(c->fd, too_long_msg, sizeof(too_long_msg) - 1, nil);
 			session_close(c, serv);
 			return;
 		}
@@ -410,7 +366,7 @@ static void server_handle(int epfd, server * serv)
 
 		c = session_new(epfd, serv);
 		if (c == nil) {
-			sys_write(conn_sock, limit_conn_msg, sizeof(limit_conn_msg), nil);
+			sys_write(conn_sock, limit_conn_msg, sizeof(limit_conn_msg) - 1, nil);
 			sys_close(conn_sock);
 			continue;
 		}
@@ -429,7 +385,7 @@ static void server_handle(int epfd, server * serv)
 		c->name_used = 0;
 		c->name_ok = false;
 
-		sys_write(conn_sock, "Your name please (max 32 symbols): ", 36, nil);
+		sys_write(conn_sock, "Your name please (max 29): ", 27, nil);
 	}
 }
 
@@ -521,10 +477,9 @@ static int server_init(server * serv, uint16 port)
 void _start(void)
 {
 	server serv;
-	arena a;
+	client_pool *p[max_pools];
 
-	arena_create(&a, max_pools * 8);
-	serv.first_clp = arena_alloc(&a, max_pools * 8);
+	serv.first_clp = p;
 	serv.n_pls = 0;
 	/* create pool for clients */
 	session_new_clp(&serv);
